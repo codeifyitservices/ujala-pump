@@ -1,0 +1,105 @@
+import mongoose from 'mongoose';
+
+const incentiveClaimSchema = new mongoose.Schema(
+  {
+    sale: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Sale',
+      required: false,
+    },
+    sellerType: {
+      type: String,
+      enum: ['Distributor', 'Dealer', 'SubDealer', 'Plumber'],
+      required: true,
+    },
+    installation: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Installation',
+      required: false,
+    },
+    sellerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true,
+    },
+    sellerName: {
+      type: String,
+      required: true,
+    },
+    product: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Product',
+      required: true,
+    },
+    serialNumber: {
+      type: String,
+      uppercase: true,
+      trim: true,
+    },
+    model: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Model',
+    },
+    modelName: {
+      type: String,
+    },
+    incentiveAmount: {
+      type: Number,
+      default: 0,
+    },
+    points: {
+      type: Number,
+      default: 0,
+    },
+    saleGroupId: {
+      type: String,
+      default: null,
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: ['Approval Pending', 'Approved', 'Rejected', 'Incomplete'],
+      default: 'Approval Pending',
+    },
+    rejectionReason: {
+      type: String,
+      default: '',
+    },
+    previousRejectionReason: {
+      type: String,
+      default: '',
+    },
+    reapplyNotes: {
+      type: String,
+      default: '',
+    },
+    reappliedAt: {
+      type: Date,
+      default: null,
+    },
+    reapplyCount: {
+      type: Number,
+      default: 0,
+    },
+    claimDate: {
+      type: Date,
+      default: Date.now,
+    },
+    processedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    processedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  { timestamps: true }
+);
+
+
+incentiveClaimSchema.index({ sellerId: 1 });
+incentiveClaimSchema.index({ status: 1 });
+incentiveClaimSchema.index({ claimDate: -1 });
+
+export default mongoose.model('IncentiveClaim', incentiveClaimSchema);

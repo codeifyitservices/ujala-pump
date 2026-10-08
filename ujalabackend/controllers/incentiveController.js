@@ -1,0 +1,730 @@
+import mongoose from 'mongoose';
+import IncentiveClaim from '../models/IncentiveClaim.js';
+import Distributor from '../models/Distributor.js';
+import Dealer from '../models/Dealer.js';
+import SubDealer from '../models/SubDealer.js';
+import Plumber from '../models/Plumber.js';
+import User from '../models/User.js';
+import Sale from '../models/Sale.js';
+import UserRole from '../models/UserRole.js';
+import PayoutRequest from '../models/PayoutRequest.js';
+
+const getSellerInfo = async (sellerType, rawSellerId, userId, username) => {
+  let model;
+  let fields =
+    'name contactPerson contactPhone email walletIncentive walletPoints eligibleForIncentive eligibleForPoints savedPayoutDetails';
+  if (sellerType === 'Distributor') {
+    model = Distributor;
+    fields = 'distributorId ' + fields;
+  } else if (sellerType === 'Dealer') {
+    model = Dealer;
+    fields = 'dealerId ' + fields;
+  } else if (sellerType === 'SubDealer') {
+    model = SubDealer;
+    fields = 'subDealerId ' + fields;
+  } else if (sellerType === 'Plumber') {
+    model = Plumber;
+    fields = 'name plumberId phone username walletIncentive walletPoints eligibleForIncentive savedPayoutDetails';
+  } else {
+    return null;
+  }
+
+  const sellerId = rawSellerId?._id || rawSellerId;
+  let seller = null;
+  if (sellerId && mongoose.Types.ObjectId.isValid(sellerId)) {
+    seller = await model.findById(sellerId).select(fields).lean();
+  }
+
+  // Check custom ID from sellerId if string or object
+  if (!seller && rawSellerId) {
+    const rawStr = String(rawSellerId?.plumberId || rawSellerId?.distributorId || rawSellerId?.dealerId || rawSellerId?.subDealerId || (typeof rawSellerId === 'string' ? rawSellerId : '')).trim();
+    if (rawStr) {
+      seller = await model.findOne({
+        $or: [
+          { plumberId: rawStr },
+          { distributorId: rawStr },
+          { dealerId: rawStr },
+          { subDealerId: rawStr },
+          { phone: rawStr },
+          { username: { $regex: new RegExp(`^${rawStr}$`, 'i') } },
+        ],
+      }).select(fields).lean();
+    }
+  }
+
+  if (!seller && userId && mongoose.Types.ObjectId.isValid(userId)) {
+    const userDoc = await User.findById(userId).lean();
+    if (userDoc) {
+      const fieldKey =
+        sellerType === 'Distributor'
+          ? 'distributor'
+          : sellerType === 'Dealer'
+          ? 'dealer'
+          : sellerType === 'SubDealer'
+          ? 'subDealer'
+          : sellerType === 'Plumber'
+          ? 'plumber'
+          : null;
+      if (fieldKey && userDoc[fieldKey] && mongoose.Types.ObjectId.isValid(userDoc[fieldKey])) {
+        seller = await model.findById(userDoc[fieldKey]).select(fields).lean();
+      }
+      if (!seller && userDoc[fieldKey] && typeof userDoc[fieldKey] === 'string') {
+        const rawF = userDoc[fieldKey].trim();
+        seller = await model.findOne({
+          $or: [
+            { plumberId: rawF },
+            { distributorId: rawF },
+            { dealerId: rawF },
+            { subDealerId: rawF },
+            { phone: rawF },
+          ],
+        }).select(fields).lean();
+      }
+      if (!seller && userDoc.username) {
+        const rawU = String(userDoc.username).trim();
+        seller = await model.findOne({
+          $or: [
+            { username: { $regex: new RegExp(`^${rawU}$`, 'i') } },
+            { plumberId: rawU },
+            { distributorId: rawU },
+            { dealerId: rawU },
+            { subDealerId: rawU },
+            { phone: rawU },
+          ],
+        }).select(fields).lean();
+      }
+    }
+  }
+
+  if (!seller && username) {
+    const rawU = String(username).trim();
+    seller = await model.findOne({
+      $or: [
+        { username: { $regex: new RegExp(`^${rawU}$`, 'i') } },
+        { plumberId: rawU },
+        { distributorId: rawU },
+        { dealerId: rawU },
+        { subDealerId: rawU },
+        { phone: rawU },
+      ],
+    }).select(fields).lean();
+  }
+
+  if (!seller && userId && mongoose.Types.ObjectId.isValid(userId)) {
+    seller = (await model.findOne({ user: userId }).select(fields).lean()) ||
+      (await model.findById(userId).select(fields).lean());
+  }
+
+  return seller;
+};
+
+// GET /api/incentives - Admin: all claims grouped by saleGroupId
+export const getAllClaims = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    let query = {};
+
+    if (startDate || endDate) {
+      query.claimDate = {};
+      if (startDate) query.claimDate.$gte = new Date(startDate);
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        query.claimDate.$lte = end;
+      }
+    }
+
+    const claims = await IncentiveClaim.find(query)
+      .populate('product', 'serialNumber')
+      .populate('model', 'name code incentive points')
+      .populate({
+        path: 'processedBy',
+        select: 'username role accountsMember',
+        populate: { path: 'accountsMember', select: 'name accountsId' },
+      })
+      .sort({ claimDate: -1 })
+      .lean();
+
+    const unresolvedIds = claims
+      .filter((c) => c.processedBy && mongoose.Types.ObjectId.isValid(c.processedBy) && !c.processedBy.username)
+      .map((c) => c.processedBy);
+
+    const userRoleMap = new Map();
+    if (unresolvedIds.length > 0) {
+      const userRoles = await UserRole.find({ _id: { $in: unresolvedIds } }).select('name username').lean();
+      userRoles.forEach((ur) => userRoleMap.set(String(ur._id), ur));
+    }
+
+    // Group by saleGroupId where present; ungrouped items get their own entry
+    const groupMap = new Map();
+    const ungrouped = [];
+
+    for (const c of claims) {
+      const resolvedProcessedBy = c.processedBy?.username
+        ? c.processedBy
+        : c.processedBy && userRoleMap.has(String(c.processedBy))
+        ? { ...userRoleMap.get(String(c.processedBy)), role: 'staff' }
+        : c.processedBy;
+
+      if (c.saleGroupId) {
+        if (!groupMap.has(c.saleGroupId)) {
+          groupMap.set(c.saleGroupId, {
+            _id: c._id, // use first claim id as representative
+            saleGroupId: c.saleGroupId,
+            sellerType: c.sellerType,
+            sellerId: c.sellerId,
+            sellerName: c.sellerName,
+            claimDate: c.claimDate,
+            status: c.status, // all in group share status when approved/rejected
+            rejectionReason: c.rejectionReason,
+            previousRejectionReason: c.previousRejectionReason,
+            reapplyNotes: c.reapplyNotes,
+            reappliedAt: c.reappliedAt,
+            reapplyCount: c.reapplyCount || 0,
+            processedBy: resolvedProcessedBy,
+            processedAt: c.processedAt,
+            items: [],
+            totalIncentive: 0,
+            totalPoints: 0,
+          });
+        }
+        const grp = groupMap.get(c.saleGroupId);
+        grp.items.push(c);
+        grp.totalIncentive += c.incentiveAmount || 0;
+        grp.totalPoints += c.points || 0;
+        // If any item is pending, group is pending
+        if (c.status === 'Approval Pending') grp.status = 'Approval Pending';
+        if (c.reapplyNotes) grp.reapplyNotes = c.reapplyNotes;
+        if (c.reappliedAt) grp.reappliedAt = c.reappliedAt;
+        if (resolvedProcessedBy) grp.processedBy = resolvedProcessedBy;
+        if (c.processedAt) grp.processedAt = c.processedAt;
+      } else {
+        ungrouped.push({
+          _id: c._id,
+          saleGroupId: null,
+          sellerType: c.sellerType,
+          sellerId: c.sellerId,
+          sellerName: c.sellerName,
+          claimDate: c.claimDate,
+          status: c.status,
+          rejectionReason: c.rejectionReason,
+          previousRejectionReason: c.previousRejectionReason,
+          reapplyNotes: c.reapplyNotes,
+          reappliedAt: c.reappliedAt,
+          reapplyCount: c.reapplyCount || 0,
+          processedBy: resolvedProcessedBy,
+          processedAt: c.processedAt,
+          items: [c],
+          totalIncentive: c.incentiveAmount || 0,
+          totalPoints: c.points || 0,
+        });
+      }
+    }
+
+    const grouped = [...groupMap.values(), ...ungrouped].sort(
+      (a, b) => new Date(b.claimDate) - new Date(a.claimDate)
+    );
+
+    res.json(grouped);
+  } catch (err) {
+    console.error('getAllClaims error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// GET /api/incentives/:id - Single claim detail
+export const getClaimById = async (req, res) => {
+  try {
+    const claim = await IncentiveClaim.findById(req.params.id)
+      .populate('sale')
+      .populate('product', 'serialNumber')
+      .populate('model', 'name code incentive points')
+      .populate({
+        path: 'installation',
+        populate: {
+          path: 'plumber',
+          select: 'name plumberId phone username',
+        }
+      })
+      .lean();
+
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+
+    // Fallback: If sale is empty (e.g. Plumber claim), query the Sale model for product's sale details
+    if (!claim.sale && claim.product) {
+      claim.sale = await Sale.findOne({ product: claim.product._id || claim.product }).lean();
+    }
+
+    // If grouped, fetch all claims with same saleGroupId
+    let groupClaims = [claim];
+    if (claim.saleGroupId) {
+      groupClaims = await IncentiveClaim.find({
+        saleGroupId: claim.saleGroupId,
+      })
+        .populate('sale')
+        .populate('product', 'serialNumber')
+        .populate('model', 'name code')
+        .populate({
+          path: 'installation',
+          populate: {
+            path: 'plumber',
+            select: 'name plumberId phone username',
+          }
+        })
+        .lean();
+
+      // Populate fallback sale details for any items in group claims
+      for (const gc of groupClaims) {
+        if (!gc.sale && gc.product) {
+          gc.sale = await Sale.findOne({ product: gc.product._id || gc.product }).lean();
+        }
+      }
+    }
+
+    const seller = await getSellerInfo(claim.sellerType, claim.sellerId);
+
+    res.json({ ...claim, groupClaims, seller });
+  } catch (err) {
+    console.error('getClaimById error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// POST /api/incentives/:id/verify - Admin approve/reject/incomplete
+// Acts on all claims in the same saleGroupId
+export const verifyClaim = async (req, res) => {
+  try {
+    const { action, rejectionReason } = req.body;
+    const claim = await IncentiveClaim.findById(req.params.id);
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+
+    if (
+      action !== 'approve' &&
+      action !== 'reject' &&
+      action !== 'incomplete'
+    ) {
+      return res.status(400).json({ message: 'Invalid action' });
+    }
+    if (action === 'reject' && (!rejectionReason || !rejectionReason.trim())) {
+      return res.status(400).json({ message: 'Rejection reason is required' });
+    }
+
+    // Get all claims in the same group
+    const allClaims = claim.saleGroupId
+      ? await IncentiveClaim.find({ saleGroupId: claim.saleGroupId })
+      : [claim];
+
+    // Group approved claims by seller to create a single payout per seller in this batch
+    const approvedSellers = new Map();
+
+    for (const c of allClaims) {
+      if (c.status === 'Approved') continue; // skip already approved
+
+      if (action === 'approve') {
+        c.status = 'Approved';
+        c.processedBy = req.user.id;
+        c.processedAt = new Date();
+        const incUpdate = {
+          $inc: { walletIncentive: c.incentiveAmount, walletPoints: c.points },
+        };
+        if (c.sellerType === 'Distributor')
+          await Distributor.findByIdAndUpdate(c.sellerId, incUpdate);
+        else if (c.sellerType === 'Dealer')
+          await Dealer.findByIdAndUpdate(c.sellerId, incUpdate);
+        else if (c.sellerType === 'SubDealer')
+          await SubDealer.findByIdAndUpdate(c.sellerId, incUpdate);
+        else if (c.sellerType === 'Plumber')
+          await Plumber.findByIdAndUpdate(c.sellerId, incUpdate);
+
+        if (c.incentiveAmount > 0) {
+          const sKey = `${c.sellerType}_${c.sellerId}`;
+          if (!approvedSellers.has(sKey)) {
+            approvedSellers.set(sKey, {
+              sellerType: c.sellerType,
+              sellerId: c.sellerId,
+              sellerName: c.sellerName,
+              amount: 0,
+              serials: [],
+            });
+          }
+          const sEntry = approvedSellers.get(sKey);
+          sEntry.amount += Number(c.incentiveAmount) || 0;
+          if (c.serialNumber && !sEntry.serials.includes(c.serialNumber)) {
+            sEntry.serials.push(c.serialNumber);
+          }
+        }
+      } else if (action === 'reject') {
+        c.status = 'Rejected';
+        c.rejectionReason = rejectionReason.trim();
+        c.processedBy = req.user.id;
+        c.processedAt = new Date();
+      } else {
+        c.status = 'Incomplete';
+        c.processedBy = req.user.id;
+        c.processedAt = new Date();
+      }
+      await c.save();
+    }
+
+    // Auto-create payout request records for approved incentives
+    if (action === 'approve' && approvedSellers.size > 0) {
+      for (const [, sEntry] of approvedSellers) {
+        if (sEntry.amount <= 0) continue;
+
+        let Model;
+        if (sEntry.sellerType === 'Distributor') Model = Distributor;
+        else if (sEntry.sellerType === 'Dealer') Model = Dealer;
+        else if (sEntry.sellerType === 'SubDealer') Model = SubDealer;
+        else if (sEntry.sellerType === 'Plumber') Model = Plumber;
+
+        let sellerDoc = null;
+        if (Model) {
+          sellerDoc = await Model.findById(sEntry.sellerId).lean();
+        }
+
+        const savedDetails = sellerDoc?.savedPayoutDetails || {};
+        const payoutMethod = savedDetails.payoutMethod || 'Bank';
+        const bankDetails = savedDetails.bankDetails || {
+          accountNumber: '',
+          ifscCode: '',
+          bankName: '',
+          accountHolderName: sellerDoc?.name || sEntry.sellerName || '',
+        };
+        const upiId = savedDetails.upiId || '';
+
+        const serialsText =
+          sEntry.serials.length > 0
+            ? ` (${sEntry.serials.slice(0, 5).join(', ')})`
+            : '';
+        const notes = `Approved Incentive${serialsText}`;
+
+        await PayoutRequest.create({
+          requesterType: sEntry.sellerType,
+          requesterId: sEntry.sellerId,
+          requesterName:
+            sellerDoc?.name || sEntry.sellerName || sEntry.sellerType,
+          requesterPhone:
+            sellerDoc?.phone || sellerDoc?.contactPhone || '',
+          amount: sEntry.amount,
+          status: 'Pending',
+          payoutMethod,
+          bankDetails: payoutMethod === 'Bank' ? bankDetails : undefined,
+          upiId: payoutMethod === 'UPI' ? upiId : '',
+          notes,
+          requestedAt: new Date(),
+        });
+      }
+    }
+
+    res.json({ message: `Claim ${action}d successfully` });
+  } catch (err) {
+    console.error('verifyClaim error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// GET /api/incentives/my/claims - Seller: their own claims
+export const getMyClaims = async (req, res) => {
+  try {
+    let sellerType, sellerId;
+    if (req.user.distributor) {
+      sellerType = 'Distributor';
+      sellerId = req.user.distributor;
+    } else if (req.user.dealer) {
+      sellerType = 'Dealer';
+      sellerId = req.user.dealer;
+    } else if (req.user.subDealer) {
+      sellerType = 'SubDealer';
+      sellerId = req.user.subDealer;
+    } else if (req.user.plumber) {
+      sellerType = 'Plumber';
+      sellerId = req.user.plumber;
+    } else return res.status(403).json({ message: 'Unauthorized' });
+
+    // Fetch seller eligibility and wallet info
+    const seller = await getSellerInfo(
+      sellerType,
+      sellerId,
+      req.user.id,
+      req.user.username
+    );
+    const finalSellerId = seller ? seller._id : sellerId;
+    const eligibleForIncentive = seller?.eligibleForIncentive !== false;
+    const eligibleForPoints =
+      sellerType !== 'Plumber' && seller?.eligibleForPoints !== false;
+
+    const rawClaims = await IncentiveClaim.find({ sellerId: finalSellerId })
+      .populate('product', 'serialNumber productName')
+      .populate('model', 'name code')
+      .sort({ claimDate: -1 })
+      .lean();
+
+    // Sanitize claim data according to eligibility
+    const claims = rawClaims.map((c) => ({
+      ...c,
+      incentiveAmount: eligibleForIncentive ? (c.incentiveAmount || 0) : null,
+      points: eligibleForPoints ? (c.points || 0) : null,
+    }));
+
+    // Group by saleGroupId
+    const groupMap = new Map();
+    const ungrouped = [];
+    for (const c of claims) {
+      if (c.saleGroupId) {
+        if (!groupMap.has(c.saleGroupId)) {
+          groupMap.set(c.saleGroupId, {
+            _id: c._id,
+            saleGroupId: c.saleGroupId,
+            claimDate: c.claimDate,
+            status: c.status,
+            rejectionReason: c.rejectionReason,
+            previousRejectionReason: c.previousRejectionReason,
+            reapplyNotes: c.reapplyNotes,
+            reappliedAt: c.reappliedAt,
+            reapplyCount: c.reapplyCount || 0,
+            items: [],
+            totalIncentive: eligibleForIncentive ? 0 : null,
+            totalPoints: eligibleForPoints ? 0 : null,
+          });
+        }
+        const grp = groupMap.get(c.saleGroupId);
+        grp.items.push(c);
+        if (eligibleForIncentive) grp.totalIncentive += c.incentiveAmount || 0;
+        if (eligibleForPoints) grp.totalPoints += c.points || 0;
+        if (c.status === 'Approval Pending') grp.status = 'Approval Pending';
+        if (c.reapplyNotes) grp.reapplyNotes = c.reapplyNotes;
+        if (c.reappliedAt) grp.reappliedAt = c.reappliedAt;
+      } else {
+        ungrouped.push({
+          _id: c._id,
+          saleGroupId: null,
+          claimDate: c.claimDate,
+          status: c.status,
+          rejectionReason: c.rejectionReason,
+          previousRejectionReason: c.previousRejectionReason,
+          reapplyNotes: c.reapplyNotes,
+          reappliedAt: c.reappliedAt,
+          reapplyCount: c.reapplyCount || 0,
+          items: [c],
+          totalIncentive: eligibleForIncentive ? (c.incentiveAmount || 0) : null,
+          totalPoints: eligibleForPoints ? (c.points || 0) : null,
+        });
+      }
+    }
+
+    const grouped = [...groupMap.values(), ...ungrouped].sort(
+      (a, b) => new Date(b.claimDate) - new Date(a.claimDate)
+    );
+
+    // Calculate pending statistics
+    let pendingIncentive = 0;
+    let pendingPoints = 0;
+    for (const g of grouped) {
+      if (g.status === 'Approval Pending') {
+        if (eligibleForIncentive && typeof g.totalIncentive === 'number') {
+          pendingIncentive += g.totalIncentive;
+        }
+        if (eligibleForPoints && typeof g.totalPoints === 'number') {
+          pendingPoints += g.totalPoints;
+        }
+      }
+    }
+
+    res.json({
+      sellerType,
+      sellerName: seller?.name || '',
+      claims: grouped,
+      wallet: {
+        incentive: eligibleForIncentive ? (seller?.walletIncentive ?? 0) : null,
+        points: eligibleForPoints ? (seller?.walletPoints ?? 0) : null,
+      },
+      stats: {
+        pendingIncentive: eligibleForIncentive ? pendingIncentive : null,
+        pendingPoints: eligibleForPoints ? pendingPoints : null,
+        totalClaims: grouped.length,
+      },
+      eligibleForIncentive,
+      eligibleForPoints,
+      savedPayoutDetails: seller?.savedPayoutDetails || null,
+    });
+  } catch (err) {
+    console.error('getMyClaims error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Helper to revert approved claim rewards from seller wallets
+const revertApprovedClaimsWallet = async (claims) => {
+  for (const claim of claims) {
+    if (claim.status === 'Approved') {
+      const decUpdate = {
+        $inc: {
+          walletIncentive: -claim.incentiveAmount,
+          walletPoints: -claim.points,
+        },
+      };
+      if (claim.sellerType === 'Distributor') {
+        await Distributor.findByIdAndUpdate(claim.sellerId, decUpdate);
+      } else if (claim.sellerType === 'Dealer') {
+        await Dealer.findByIdAndUpdate(claim.sellerId, decUpdate);
+      } else if (claim.sellerType === 'SubDealer') {
+        await SubDealer.findByIdAndUpdate(claim.sellerId, decUpdate);
+      } else if (claim.sellerType === 'Plumber') {
+        await Plumber.findByIdAndUpdate(claim.sellerId, decUpdate);
+      }
+    }
+  }
+};
+
+// DELETE /api/incentives/:id - Admin: Delete claim or claim group
+export const deleteClaim = async (req, res) => {
+  try {
+    const claim = await IncentiveClaim.findById(req.params.id);
+    if (!claim) return res.status(404).json({ message: 'Claim not found' });
+
+    const claimsToDelete = claim.saleGroupId
+      ? await IncentiveClaim.find({ saleGroupId: claim.saleGroupId })
+      : [claim];
+
+    await revertApprovedClaimsWallet(claimsToDelete);
+
+    if (claim.saleGroupId) {
+      await IncentiveClaim.deleteMany({ saleGroupId: claim.saleGroupId });
+    } else {
+      await claim.deleteOne();
+    }
+
+    res.json({ message: 'Claim deleted successfully' });
+  } catch (err) {
+    console.error('deleteClaim error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// DELETE /api/incentives - Admin: Delete multiple claims
+export const deleteMultipleClaims = async (req, res) => {
+  try {
+    const { claimIds } = req.body;
+    if (!claimIds || claimIds.length === 0) {
+      return res.status(400).json({ message: 'No claim IDs provided' });
+    }
+
+    const claims = await IncentiveClaim.find({ _id: { $in: claimIds } });
+    const saleGroupIds = [];
+    const directClaimIds = [];
+
+    for (const claim of claims) {
+      if (claim.saleGroupId) {
+        saleGroupIds.push(claim.saleGroupId);
+      } else {
+        directClaimIds.push(claim._id);
+      }
+    }
+
+    const allClaimsToDelete = await IncentiveClaim.find({
+      $or: [
+        { saleGroupId: { $in: saleGroupIds } },
+        { _id: { $in: directClaimIds } },
+      ],
+    });
+
+    await revertApprovedClaimsWallet(allClaimsToDelete);
+
+    if (saleGroupIds.length > 0) {
+      await IncentiveClaim.deleteMany({ saleGroupId: { $in: saleGroupIds } });
+    }
+    if (directClaimIds.length > 0) {
+      await IncentiveClaim.deleteMany({ _id: { $in: directClaimIds } });
+    }
+
+    res.json({ message: 'Claims deleted successfully' });
+  } catch (err) {
+    console.error('deleteMultipleClaims error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// GET /api/incentives/pending-count - Admin & Accounts: Get count of pending incentive claims
+export const getPendingClaimsCount = async (req, res) => {
+  try {
+    const groupedPending = await IncentiveClaim.distinct('saleGroupId', {
+      status: 'Approval Pending',
+      saleGroupId: { $ne: null },
+    });
+    const ungroupedPendingCount = await IncentiveClaim.countDocuments({
+      status: 'Approval Pending',
+      saleGroupId: null,
+    });
+    const count = groupedPending.length + ungroupedPendingCount;
+    res.json({ count });
+  } catch (err) {
+    console.error('getPendingClaimsCount error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// POST /api/incentives/:id/reapply - Seller / Plumber: Reapply for a rejected incentive claim
+export const reapplyClaim = async (req, res) => {
+  try {
+    let sellerType, sellerId;
+    if (req.user.distributor) {
+      sellerType = 'Distributor';
+      sellerId = req.user.distributor;
+    } else if (req.user.dealer) {
+      sellerType = 'Dealer';
+      sellerId = req.user.dealer;
+    } else if (req.user.subDealer) {
+      sellerType = 'SubDealer';
+      sellerId = req.user.subDealer;
+    } else if (req.user.plumber) {
+      sellerType = 'Plumber';
+      sellerId = req.user.plumber;
+    } else {
+      return res.status(403).json({ message: 'Unauthorized for incentive claim reapplication' });
+    }
+
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    const claim = await IncentiveClaim.findById(id);
+    if (!claim) {
+      return res.status(404).json({ message: 'Incentive claim not found' });
+    }
+
+    // Verify ownership
+    const seller = await getSellerInfo(sellerType, sellerId, req.user.id, req.user.username);
+    const finalSellerId = seller ? seller._id.toString() : sellerId?.toString();
+    if (claim.sellerId.toString() !== finalSellerId) {
+      return res.status(403).json({ message: 'You can only reapply for your own claims' });
+    }
+
+    if (claim.status !== 'Rejected') {
+      return res.status(400).json({ message: 'Only rejected incentive claims can be reapplied' });
+    }
+
+    // If part of a saleGroupId, update all in the group
+    const claimsToUpdate = claim.saleGroupId
+      ? await IncentiveClaim.find({ saleGroupId: claim.saleGroupId, sellerId: finalSellerId })
+      : [claim];
+
+    for (const c of claimsToUpdate) {
+      c.status = 'Approval Pending';
+      c.previousRejectionReason = c.rejectionReason || '';
+      c.rejectionReason = '';
+      c.reapplyNotes = notes?.trim() || '';
+      c.reappliedAt = new Date();
+      c.reapplyCount = (c.reapplyCount || 0) + 1;
+      await c.save();
+    }
+
+    res.json({
+      message: 'Incentive claim resubmitted successfully for verification',
+      claim,
+    });
+  } catch (err) {
+    console.error('reapplyClaim error:', err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+
